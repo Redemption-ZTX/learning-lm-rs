@@ -71,29 +71,34 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    let num_rows = x.size(0); //获取行数
-    let num_cols = x.siza(1); //获取列数
+    let num_rows = x.shape[0]; // 获取行数
+    let num_cols = x.shape[1]; // 获取列数
 
-    for i in 0..num_rows {
-        let mut sum_of_squares = 0.0f32;
+    let x_data = x.data();
+    let w_data = w.data();
+    let y_data = unsafe { y.data_mut() };
 
-        //计算一行的平方和
+    // 确保 w 的形状与每行的长度匹配
+    assert_eq!(w.shape.len(), 1);
+    assert_eq!(w.shape[0], num_cols);
 
-        for j in 0..num_cols {
-            let x_val = x.get(i, j);
-            sum_of_squares += x_val * x_val;
-        }
+    for row in 0..num_rows {
+        let start_index = row * num_cols;
+        let end_index = start_index + num_cols;
 
-        //计算RMS
+        // 计算当前行的平方和
+        let sum_of_squares: f32 = x_data[start_index..end_index]
+            .iter()
+            .map(|&value| value * value)
+            .sum();
 
-        let RMS = (sum_of_squares / num_cols as f32 + epsilon).sqrt();
+        // 计算当前行的 RMS
+        let rms = (sum_of_squares / num_cols as f32 + epsilon).sqrt();
 
-        //归一化
-
-        for j in 0..num_cols {
-            let x_val = x.get(i, j);
-            let w_val = w.get(i, j);
-            y.set(i, j, w_val * x_val / RMS); //设置y中每一个位置的值，element-wise
+        // 归一化并应用权重
+        for col in 0..num_cols {
+            let index = start_index + col;
+            y_data[index] = w_data[col] * x_data[index] / rms;
         }
     }
 }
@@ -105,23 +110,12 @@ pub fn sigmoid(x: f32) -> f32 {
 }
 
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    let len = y.size();
-    assert!(len == x.size());
+    //let len = y.size();
+    //assert!(len == x.size());
 
-    let _y = unsafe { y.data_mut() };
-    let _x = x.data();
-
-    let num_rows = x.size(0);
-    let num_cols = x.size(1);
-
-    for i in 0..num_rows {
-        for j in 0..num_cols {
-            let x_sigmoid = sigmoid(x.get(i, j));
-            let silu_x = x_sigmoid * x.get(i, j);
-            let y_val = y.get(i, j);
-            y.set(i, j, silu_x * y_val);
-        }
-    }
+    //let _y = unsafe { y.data_mut() };
+    //let _x = x.data();
+    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
 }
 
 // C = beta * C + alpha * A @ B^T
