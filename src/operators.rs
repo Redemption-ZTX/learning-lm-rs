@@ -71,8 +71,8 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    let num_rows = x.shape[0]; // 获取行数
-    let num_cols = x.shape[1]; // 获取列数
+    let num_rows = x.shape()[0]; // 获取行数
+    let num_cols = x.shape()[1]; // 获取列数
 
     let x_data = x.data();
     let w_data = w.data();
