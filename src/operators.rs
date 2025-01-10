@@ -78,10 +78,6 @@ pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: 
     let w_data = w.data();
     let y_data = unsafe { y.data_mut() };
 
-    // 确保 w 的形状与每行的长度匹配
-    assert_eq!(w.shape.len(), 1);
-    assert_eq!(w.shape[0], num_cols);
-
     for row in 0..num_rows {
         let start_index = row * num_cols;
         let end_index = start_index + num_cols;
