@@ -93,6 +93,8 @@ impl LLamaParams<f32> {
             w_down,
             rms_out_w: extract_tensor("model.norm.weight"),
             lm_head: extract_tensor("lm_head.weight"),
+            
+
         }
     }
 }
