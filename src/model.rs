@@ -1,13 +1,19 @@
-use std::fs::File;
-use std::vec;
-
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators as OP;
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
+use std::convert::TryInto;
+use std::error::Error as StdError;
+use std::error::Error;
+use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
+use std::vec;
+use tokenizers::Tokenizer;
+
+use crate::model;
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
@@ -21,7 +27,7 @@ pub struct Llama<T> {
     max_seq_len: usize,     // maximum sequence length
     params: LLamaParams<T>, // trained weights of this model
     bos_token_id: u32,      // start token id
-    eos_token_id: u32,      // end token id
+    pub eos_token_id: u32,  // end token id
 }
 
 impl Llama<f32> {
@@ -58,6 +64,7 @@ impl Llama<f32> {
         let past_seq_len = cache.len();
         cache.increment(seq_len);
         let total_seq_len = past_seq_len + seq_len;
+        //用于判断多少个q，对应一个kv
         let n_groups = self.n_q_h / self.n_kv_h;
 
         // Some pre-allocated buffers that will be reused
@@ -71,9 +78,10 @@ impl Llama<f32> {
 
         // Computation Starts Here
         // Embedding lookup
-        OP::gather(&mut residual, input, &self.params.embedding_table);
+        OP::gather(&mut residual, input, &self.params.embedding_table); //获取文本的词向量
 
         for layer in 0..self.n_layers {
+            //归一化
             OP::rms_norm(
                 &mut hidden_states,
                 &residual,
@@ -101,10 +109,43 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
-
-            todo!("mlp(...)");
+            // Call self_attention
+            {
+                // score = Q @ K.T / sqrt(dim)
+                q.reshape(&vec![seq_len, self.n_q_h * self.dqkv]);
+                // 获得的形状，应该为n_q_h * seq_len * total
+                OP::vec_multi(
+                    &mut att_scores,
+                    q,
+                    full_k,
+                    1. / (self.dqkv as f32).sqrt(),
+                    true,
+                );
+                OP::masked_softmax(&mut att_scores);
+                // x = attn @ V
+                // 这里需要用到权重乘法，即上一步得出的是权重，接下来每一个权重对应的V向量
+                // vec_multi(&mut hidden_states, att_scores, &full_k, 1., false);
+                OP::vec_multi_wight(&mut hidden_states, &att_scores, &full_v);
+                // x shape 6*128,
+                OP::matmul_transb(
+                    &mut residual,
+                    1.,
+                    &hidden_states,
+                    &self.params.wo[layer],
+                    1.,
+                )
+            }
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps,
+            );
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -124,7 +165,6 @@ impl Llama<f32> {
 
         logits
     }
-
     pub fn generate(
         &self,
         token_ids: &[u32],
@@ -133,11 +173,71 @@ impl Llama<f32> {
         top_k: u32,
         temperature: f32,
     ) -> Vec<u32> {
-        let mut result = Vec::<u32>::new();
+        let mut result = Vec::new();
+        let mut cache = self.new_cache();
+        let mut input_ids = token_ids.to_vec();
 
-        todo!("实现文本生成");
+        for _ in 0..max_len {
+            let shape = vec![input_ids.len()];
+            let input = Tensor::new(input_ids.clone(), &shape);
+
+            let output = self.forward(&input, &mut cache);
+            let next_token = OP::random_sample(&output, top_p, top_k, temperature);
+
+            if next_token == self.eos_token_id {
+                break;
+            }
+
+            result.push(next_token);
+            input_ids = vec![next_token];
+        }
 
         result
+    }
+}
+
+pub struct LlamaChat {
+    pub llama: model::Llama<f32>, // 模型作为结构体成员
+    pub tokenizer: Tokenizer,     // tokenizer作为结构体成员
+}
+
+impl LlamaChat {
+    /// 初始化方法
+    pub fn new(model_dir: impl AsRef<Path>) -> Result<Self, Box<dyn StdError + Send + Sync>> {
+        let llama = Llama::<f32>::from_safetensors(model_dir.as_ref());
+        let tokenizer = Tokenizer::from_file(model_dir.as_ref().join("tokenizer.json"))?;
+
+        Ok(Self { llama, tokenizer })
+    }
+
+    pub fn chat(
+        &self,
+        messages: &[(&str, &str)],
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+    ) -> Result<Vec<u32>, Box<dyn Error + Send + Sync + 'static>> {
+        let mut prompt = String::new();
+        for (role, content) in messages {
+            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+
+        let encoding = self.tokenizer.encode(prompt, true)?;
+
+        Ok(self.llama.generate(
+            encoding
+                .get_ids()
+                .iter()
+                .map(|&id| id as u32)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            max_len,
+            top_p,
+            top_k,
+            temperature,
+        ))
     }
 }
 
@@ -152,8 +252,9 @@ fn self_attention(
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize,
-) {
-    todo!("Implement self_attention");
+    wo: &Tensor<f32>,
+) -> Tensor<f32> {
+    todo!("sss")
 }
 
 pub fn mlp(
@@ -167,21 +268,12 @@ pub fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    // todo!("Implement mlp");
-    OP::rms_norm(hidden_states,residual,rms_w,eps); 
-    OP::matmul_transb(gate,0.0,hidden_states,w_gate,1.0);
-    OP::matmul_transb(up,0.0,hidden_states,w_up,1.0);
-    OP::swiglu(up,gate);
-    OP::matmul_transb(residual,1.0,up,w_down,1.0);
+    OP::rms_norm(hidden_states, residual, rms_w, eps);
+    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
+    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
+    OP::swiglu(up, gate);
+    OP::matmul_transb(residual, 1.0, up, w_down, 1.0);
 }
-
-
-// hidden = rms_norm(residual)
-// gate = hidden @ gate_weight.T
-// up = hidden @ up_weight.T
-// act = gate * sigmoid(gate) * up ## SwiGLU
-// output = act @ down_weight.T
-// residual = output + residual
 
 #[test]
 pub fn test_mlp() {
