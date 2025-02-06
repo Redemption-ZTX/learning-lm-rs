@@ -1,26 +1,44 @@
 use crate::config::LlamaConfigJson;
+use crate::tensor::NumType;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
-pub struct LLamaParams<T> {
+
+pub struct LLamaParams<T: NumType, U: NumType> {
     // token_id to embedding lookup table
-    pub embedding_table: Tensor<T>, // (vocab_size, dim)
+    pub embedding_table: Tensor<U>, // (vocab_size, dim)
     // decoder layer
     pub rms_att_w: Vec<Tensor<T>>, // (hidden_size, ) x layers
-    pub wq: Vec<Tensor<T>>,        // (n_heads * head_size, hidden_size) x layers
-    pub wk: Vec<Tensor<T>>,        // (n_kv_heads * head_size, hidden_size) x layers
-    pub wv: Vec<Tensor<T>>,        // (n_kv_heads * head_size, hidden_size) x layers
-    pub wo: Vec<Tensor<T>>,        // (hidden_size, n_heads * head_size) x layers
+    pub wq: Vec<Tensor<U>>,        // (n_heads * head_size, hidden_size) x layers
+    pub wk: Vec<Tensor<U>>,        // (n_kv_heads * head_size, hidden_size) x layers
+    pub wv: Vec<Tensor<U>>,        // (n_kv_heads * head_size, hidden_size) x layers
+    pub wo: Vec<Tensor<U>>,        // (hidden_size, n_heads * head_size) x layers
     // ffn layer
     pub rms_ffn_w: Vec<Tensor<T>>, // (hidden_size, ) x layers
-    pub w_up: Vec<Tensor<T>>,      // (intermediate_size, hidden_size) x layers
-    pub w_gate: Vec<Tensor<T>>,    // (intermediate_size, hidden_size) x layers
-    pub w_down: Vec<Tensor<T>>,    // (hidden_size, intermediate_size) x layers
+    pub w_up: Vec<Tensor<U>>,      // (intermediate_size, hidden_size) x layers
+    pub w_gate: Vec<Tensor<U>>,    // (intermediate_size, hidden_size) x layers
+    pub w_down: Vec<Tensor<U>>,    // (hidden_size, intermediate_size) x layers
     // output
     pub rms_out_w: Tensor<T>, // (hidden_size, )
-    pub lm_head: Tensor<T>,   // (vocab_size, dim)
+    pub lm_head: Tensor<U>,   // (vocab_size, dim)
+    // 量化参数
+    pub weight_scales: WeightScales,
 }
 
-impl LLamaParams<f32> {
+// 存储量化参数的结构体
+#[derive(Debug)]
+pub struct WeightScales {
+    pub wq_scales: Vec<f32>,
+    pub wk_scales: Vec<f32>,
+    pub wv_scales: Vec<f32>,
+    pub wo_scales: Vec<f32>,
+    pub w_gate_scales: Vec<f32>,
+    pub w_up_scales: Vec<f32>,
+    pub w_down_scales: Vec<f32>,
+    pub embedding_scale: f32,
+    pub lm_head_scale: f32,
+}
+
+impl LLamaParams<f32, f32> {
     pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson) -> Self {
         // 辅助函数：从 safetensors 中提取张量
         let extract_tensor = |name: &str| -> Tensor<f32> {
@@ -46,7 +64,7 @@ impl LLamaParams<f32> {
         let mut w_gate = Vec::with_capacity(n_layers);
         let mut w_down = Vec::with_capacity(n_layers);
 
-        // 加载每层的必要参数
+        // /加载每层的必要参数
         for i in 0..n_layers {
             rms_att_w.push(extract_tensor(&format!(
                 "model.layers.{i}.input_layernorm.weight"
@@ -66,7 +84,9 @@ impl LLamaParams<f32> {
             rms_ffn_w.push(extract_tensor(&format!(
                 "model.layers.{i}.post_attention_layernorm.weight"
             )));
-            w_up.push(extract_tensor(&format!("model.layers.{i}.mlp.up_proj.weight")));
+            w_up.push(extract_tensor(&format!(
+                "model.layers.{i}.mlp.up_proj.weight"
+            )));
             w_gate.push(extract_tensor(&format!(
                 "model.layers.{i}.mlp.gate_proj.weight"
             )));
@@ -93,8 +113,17 @@ impl LLamaParams<f32> {
             w_down,
             rms_out_w: extract_tensor("model.norm.weight"),
             lm_head: extract_tensor("lm_head.weight"),
-            
-
+            weight_scales: WeightScales {
+                wq_scales: vec![1.0; n_layers],
+                wk_scales: vec![1.0; n_layers],
+                wv_scales: vec![1.0; n_layers],
+                wo_scales: vec![1.0; n_layers],
+                w_gate_scales: vec![1.0; n_layers],
+                w_up_scales: vec![1.0; n_layers],
+                w_down_scales: vec![1.0; n_layers],
+                embedding_scale: 1.0,
+                lm_head_scale: 1.0,
+            },
         }
     }
 }
