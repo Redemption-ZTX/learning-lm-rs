@@ -1,33 +1,40 @@
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
+use crate::model;
 use crate::operators as OP;
 use crate::params::LLamaParams;
+use crate::tensor::NumType;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
+use std::arch::x86_64::*;
 use std::convert::TryInto;
 use std::error::Error as StdError;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use std::vec;
 use tokenizers::Tokenizer;
-
-use crate::model;
-pub struct Llama<T> {
-    vocab: usize,           // vocab size
-    n_layers: usize,        // number of layers
-    n_q_h: usize,           // number of heads for q
-    n_kv_h: usize,          // number of heads for k and v
-    d: usize,               // dimension of hidden states
-    dqkv: usize,            // length of a single q, k, or v vector
-    di: usize,              // dimension of intermediate states
-    eps: f32,               // epsilon for RMS normalization
-    rope_theta: f32,        // rope theta for rope initialization
-    max_seq_len: usize,     // maximum sequence length
-    params: LLamaParams<T>, // trained weights of this model
-    bos_token_id: u32,      // start token id
-    pub eos_token_id: u32,  // end token id
+pub struct Llama<T: NumType> {
+    vocab: usize,                                // vocab size
+    n_layers: usize,                             // number of layers
+    n_q_h: usize,                                // number of heads for q
+    n_kv_h: usize,                               // number of heads for k and v
+    d: usize,                                    // dimension of hidden states
+    dqkv: usize,                                 // length of a single q, k, or v vector
+    di: usize,                                   // dimension of intermediate states
+    eps: f32,                                    // epsilon for RMS normalization
+    rope_theta: f32,                             // rope theta for rope initialization
+    max_seq_len: usize,                          // maximum sequence length
+    params: LLamaParams<T, T>,                   // trained weights of this model
+    bos_token_id: u32,                           // start token id
+    pub eos_token_id: u32,                       // end token id
+    matrix_ops_count: std::cell::Cell<usize>,    // 原始实现计数器
+    optimized_ops_count: std::cell::Cell<usize>, // 优化实现计数器
+    matrix_time: std::cell::Cell<f64>,           // 矩阵计算总时间
+    tokenizer: Tokenizer,
 }
 
 impl Llama<f32> {
@@ -52,6 +59,16 @@ impl Llama<f32> {
             params: params,
             bos_token_id: config.bos_token_id,
             eos_token_id: config.eos_token_id,
+            matrix_ops_count: std::cell::Cell::new(0),
+            optimized_ops_count: std::cell::Cell::new(0),
+            matrix_time: std::cell::Cell::new(0.0),
+            tokenizer: Tokenizer::from_file(
+                (PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("models")
+                    .join("chat"))
+                .join("tokenizer.json"),
+            )
+            .unwrap(),
         }
     }
 
@@ -60,11 +77,11 @@ impl Llama<f32> {
     }
 
     pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<f32>) -> Tensor<f32> {
+        let start_time = Instant::now();
         let seq_len = input.size();
         let past_seq_len = cache.len();
         cache.increment(seq_len);
         let total_seq_len = past_seq_len + seq_len;
-        //用于判断多少个q，对应一个kv
         let n_groups = self.n_q_h / self.n_kv_h;
 
         // Some pre-allocated buffers that will be reused
@@ -92,9 +109,33 @@ impl Llama<f32> {
             let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
-            OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
-            OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0);
-            OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0);
+            OP::Operators::<f32>::matmul_parallel(
+                q,
+                0.,
+                &hidden_states,
+                &self.params.wq[layer],
+                1.0,
+                true,
+                Some((&self.matrix_ops_count, &self.optimized_ops_count)),
+            );
+            OP::Operators::<f32>::matmul_parallel(
+                k,
+                0.,
+                &hidden_states,
+                &self.params.wk[layer],
+                1.0,
+                true,
+                Some((&self.matrix_ops_count, &self.optimized_ops_count)),
+            );
+            OP::Operators::<f32>::matmul_parallel(
+                v,
+                0.,
+                &hidden_states,
+                &self.params.wv[layer],
+                1.0,
+                true,
+                Some((&self.matrix_ops_count, &self.optimized_ops_count)),
+            );
             OP::rope(
                 q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
                 past_seq_len,
@@ -163,6 +204,22 @@ impl Llama<f32> {
 
         OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
 
+        let total_time = start_time.elapsed().as_secs_f64();
+        self.matrix_time.set(total_time);
+
+        // 输出优化统计信息
+        // println!(
+        //     "优化统计: 优化实现次数={}, 基础实现次数={}, 时间={:.4}秒",
+        //     self.optimized_ops_count.get(),
+        //     self.matrix_ops_count.get(),
+        //     self.matrix_time.get()
+        // );
+
+        // 重置计数器和计时器
+        self.matrix_ops_count.set(0);
+        self.optimized_ops_count.set(0);
+        self.matrix_time.set(0.0);
+
         logits
     }
     pub fn generate(
@@ -193,6 +250,41 @@ impl Llama<f32> {
         }
 
         result
+    }
+    pub fn chat(
+        &self,
+        messages: &[(&str, &str)], // 每条消息是一个元组 (role, content)
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+    ) -> String {
+        // 构建对话模板
+        let mut prompt = String::new();
+        for (role, content) in messages {
+            prompt.push_str(&format!("<|im_start|>{}", role));
+            prompt.push_str("\n");
+            prompt.push_str(content);
+            prompt.push_str("<|im_end|>");
+            prompt.push_str("\n");
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+
+        // 将 prompt 转换为 &str，然后编码为 token_ids
+        let token_ids = self
+            .tokenizer
+            .encode(prompt.as_str(), true)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+
+        // 使用 generate 函数生成助手的回复
+        let generated_token_ids = self.generate(&token_ids, max_len, top_p, top_k, temperature);
+
+        // 将生成的 token_ids 转换回字符串
+        let response = self.tokenizer.decode(&generated_token_ids, true).unwrap();
+
+        response
     }
 }
 
