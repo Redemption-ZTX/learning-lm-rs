@@ -4,12 +4,49 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# 序列化相关
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-safetensors = "0.4.3"
-tokenizers = "0.19.1"
-rand = "0.8"
-egui = "0.26.0"
-eframe = "0.26.0"
+
+# 机器学习模型相关
+safetensors = "0.4.1"
+tokenizers = "0.15.0"
+half = "2.3.1"
+num-traits = "0.2"
+
+# 并行计算
+rayon = "1.8.0"
+
+# 随机数生成
+rand = { version = "0.8", features = ["std"] }
+
+# GUI相关de
+eframe = { version = "0.24.0", features = ["persistence"] }
+winapi = { version = "0.3.9", features = [
+    "winuser",
+    "windef",
+    "wingdi",
+    "winbase",
+    "libloaderapi",
+    "errhandlingapi",
+    "processenv",
+    "minwindef",
+] }
+
+# 错误处理
 anyhow = "1.0"
 thiserror = "1.0"
+
+# 工具库
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.4", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.dev]
+opt-level = 1 
