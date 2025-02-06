@@ -1,4 +1,8 @@
-use std::usize;
+use half::prelude::*;
+use num_traits::Float;
+use rayon::prelude::*;
+use std::arch::x86_64::*;
+use std::usize; // 添加 f16 支持
 
 use crate::tensor::Tensor;
 
@@ -73,8 +77,7 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    // 确保 x 是至少二维的
-    let mut shape = if x.shape().len() == 1 {
+    let shape = if x.shape().len() == 1 {
         vec![1, x.shape()[0]]
     } else {
         x.shape().clone()
@@ -464,4 +467,215 @@ fn test_matmul_transb() {
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
     ));
+}
+
+// 添加 Operators 结构体定义
+pub struct Operators<T> {
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Float + Send + Sync + Default + 'static> Operators<T> {
+    // 添加辅助函数：检查是否适合使用 FP16
+    fn is_safe_for_fp16(values: &[T]) -> bool {
+        let max_abs = values
+            .iter()
+            .map(|x| x.to_f32().unwrap().abs())
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        max_abs < 65504.0 && max_abs > 6.1e-5
+    }
+
+    #[inline]
+    pub fn matmul(a: &[T], b: &[T], c: &mut [T], m: usize, k: usize, n: usize) {
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            // 对于f32类型使用AVX2优化
+            if is_x86_feature_detected!("avx2") {
+                unsafe {
+                    matmul_f32_avx2(
+                        a.as_ptr() as *const f32,
+                        b.as_ptr() as *const f32,
+                        c.as_mut_ptr() as *mut f32,
+                        m,
+                        k,
+                        n,
+                    );
+                    return;
+                }
+            }
+        }
+        // 回退到普通实现
+        Self::matmul_fallback(a, b, c, m, k, n);
+    }
+
+    #[inline]
+    fn matmul_fallback(a: &[T], b: &[T], c: &mut [T], m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = T::zero();
+                for k in 0..k {
+                    sum = sum + a[i * k + k] * b[k * n + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn matmul_parallel(
+        c: &mut Tensor<T>,
+        beta: T,
+        a: &Tensor<T>,
+        b: &Tensor<T>,
+        alpha: T,
+        transpose_b: bool,
+        counter: Option<(&std::cell::Cell<usize>, &std::cell::Cell<usize>)>,
+    ) {
+        let a_rows = a.shape()[0];
+        let a_cols = a.shape()[1];
+        let (b_rows, b_cols) = if transpose_b {
+            (b.shape()[0], b.shape()[1])
+        } else {
+            (b.shape()[1], b.shape()[0])
+        };
+        let c_rows = c.shape()[0];
+        let c_cols = c.shape()[1];
+
+        // 检查矩阵维度是否匹配
+        if transpose_b {
+            assert_eq!(a_cols, b_cols, "A's columns must match B's columns");
+        } else {
+            assert_eq!(a_cols, b_rows, "A's columns must match B's rows");
+        }
+        assert_eq!(c_rows, a_rows, "C's rows must match A's rows");
+        assert_eq!(
+            c_cols,
+            if transpose_b { b_rows } else { b_cols },
+            "C's columns must match B's dimension"
+        );
+
+        let matrix_size = a_rows * b_rows * a_cols;
+        let parallel_threshold = T::from(10_000_usize).unwrap();
+
+        if T::from(matrix_size).unwrap() > parallel_threshold {
+            // 检查是否适合使用 FP16
+            let use_fp16 = Self::is_safe_for_fp16(a.data()) && Self::is_safe_for_fp16(b.data());
+
+            if use_fp16 && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+                // 更新优化计数器
+                if let Some((_, opt_counter)) = counter {
+                    opt_counter.set(opt_counter.get() + 1);
+                }
+
+                // 转换为 FP16
+                let a_fp16 = Self::convert_to_fp16(a.data());
+                let b_fp16 = Self::convert_to_fp16(b.data());
+                let mut results_fp32 = vec![0.0f32; c_rows * c_cols];
+                let c_data: Vec<f32> = c.data().iter().map(|x| x.to_f32().unwrap()).collect();
+
+                // 并行计算（在 FP32 中进行）
+                results_fp32
+                    .par_chunks_mut(c_cols)
+                    .enumerate()
+                    .for_each(|(i, chunk)| {
+                        for j in 0..c_cols {
+                            let mut sum_fp32 = 0.0f32;
+                            for k in 0..a_cols {
+                                let b_idx = if transpose_b {
+                                    j * b_cols + k
+                                } else {
+                                    k * b_cols + j
+                                };
+                                sum_fp32 +=
+                                    a_fp16[i * a_cols + k].to_f32() * b_fp16[b_idx].to_f32();
+                            }
+                            chunk[j] = beta.to_f32().unwrap() * c_data[i * c_cols + j]
+                                + alpha.to_f32().unwrap() * sum_fp32;
+                        }
+                    });
+
+                // 转换回原始类型
+                unsafe {
+                    let c_data = c.data_mut();
+                    for (i, &val) in results_fp32.iter().enumerate() {
+                        c_data[i] = T::from(val).unwrap();
+                    }
+                }
+            } else {
+                // 使用原始并行实现
+                let a_data = a.data();
+                let b_data = b.data();
+                let c_data = unsafe { c.data_mut() };
+
+                let mut results = vec![T::zero(); c_rows * c_cols];
+                results
+                    .par_chunks_mut(c_cols)
+                    .enumerate()
+                    .for_each(|(i, chunk)| {
+                        for j in 0..c_cols {
+                            let mut sum = T::zero();
+                            for k in 0..a_cols {
+                                let b_idx = if transpose_b {
+                                    j * b_cols + k
+                                } else {
+                                    k * b_cols + j
+                                };
+                                sum = sum + a_data[i * a_cols + k] * b_data[b_idx];
+                            }
+                            chunk[j] = beta * c_data[i * c_cols + j] + alpha * sum;
+                        }
+                    });
+
+                c_data.copy_from_slice(&results);
+            }
+        } else {
+            // 更新基础实现计数器（串行实现）
+            if let Some((basic_counter, _)) = counter {
+                basic_counter.set(basic_counter.get() + 1);
+            }
+
+            // 串行实现
+            unsafe {
+                let c_data = c.data_mut();
+                let a_data = a.data();
+                let b_data = b.data();
+
+                for i in 0..c_rows {
+                    for j in 0..c_cols {
+                        let mut sum = T::zero();
+                        for k in 0..a_cols {
+                            let b_idx = if transpose_b {
+                                j * b_cols + k
+                            } else {
+                                k * b_cols + j
+                            };
+                            sum = sum + a_data[i * a_cols + k] * b_data[b_idx];
+                        }
+                        c_data[i * c_cols + j] = beta * c_data[i * c_cols + j] + alpha * sum;
+                    }
+                }
+            }
+        }
+    }
+
+    // 辅助函数：转换为 FP16
+    fn convert_to_fp16(data: &[T]) -> Vec<f16> {
+        data.iter()
+            .map(|&x| f16::from_f32(x.to_f32().unwrap()))
+            .collect()
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn matmul_f32_avx2(a: *const f32, b: *const f32, c: *mut f32, m: usize, k: usize, n: usize) {
+    for i in 0..m {
+        for j in (0..n).step_by(8) {
+            let mut sum = _mm256_setzero_ps();
+            for p in 0..k {
+                let a_val = _mm256_set1_ps(*a.add(i * k + p));
+                let b_val = _mm256_loadu_ps(b.add(p * n + j));
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(a_val, b_val));
+            }
+            _mm256_storeu_ps(c.add(i * n + j), sum);
+        }
+    }
 }
